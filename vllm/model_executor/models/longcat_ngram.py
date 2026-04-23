@@ -21,6 +21,9 @@ from transformers.models.longcat_flash.modeling_longcat_flash import (
 )
 from transformers.models.longcat_flash import LongcatFlashConfig
 
+from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+from vllm.model_executor.layers.quantization import QuantizationConfig
+
 
 class LongcatFlashNgramConfig(LongcatFlashConfig):
     r"""
@@ -279,37 +282,59 @@ class NgramEmbedding(nn.Module):
     Computes embeddings enriched with N-gram features without maintaining internal state.
     """
 
-    def __init__(self, config, base_embeddings):
+    def __init__(
+        self,
+        config,
+        base_embeddings,
+        ngram_vocab_size_ratio: int,
+        vocab_size: int,
+        emb_split_num: int,
+        emb_neighbor_num: int,
+        hidden_size: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         self.config = config
+
         self.word_embeddings = base_embeddings
 
-        self.m = config.ngram_vocab_size_ratio * config.vocab_size
-        self.k = config.emb_split_num
-        self.n = config.emb_neighbor_num
+        self.vocab_size = vocab_size
+        self.ngram_hash_modulus_base = ngram_vocab_size_ratio * vocab_size
+        self.emb_split_num = emb_split_num
+        self.emb_neighbor_num = emb_neighbor_num
+        self.hidden_size = hidden_size
 
-        self._init_ngram_embeddings()
+        self._init_ngram_embeddings(quant_config)
         self._vocab_mods_cache = None
 
-    def _init_ngram_embeddings(self) -> None:
+    def _init_ngram_embeddings(
+        self, quant_config: Optional[QuantizationConfig] = None, prefix: str = ""
+    ) -> None:
         """Initialize N-gram embedding and projection layers."""
-        num_embedders = self.k * (self.n - 1)
-        emb_dim = self.config.hidden_size // num_embedders
+        num_embedders = self.emb_split_num * (self.emb_neighbor_num - 1)
+        emb_dim = self.hidden_size // num_embedders
 
         embedders = []
         post_projs = []
 
         for i in range(num_embedders):
-            vocab_size = int(self.m + i * 2 + 1)
-            emb = nn.Embedding(
-                vocab_size, emb_dim, padding_idx=self.config.pad_token_id
-            )
-            proj = nn.Linear(emb_dim, self.config.hidden_size, bias=False)
+            vocab_size = self.ngram_hash_modulus_base + i * 2 + 1
+            emb = nn.Embedding(vocab_size, emb_dim)
+            proj = nn.Linear(emb_dim, self.hidden_size, bias=False)
             embedders.append(emb)
             post_projs.append(proj)
 
         self.embedders = nn.ModuleList(embedders)
         self.post_projs = nn.ModuleList(post_projs)
+        # TODO: notice post_projs -> post_projs_vllm, and make sure the state dict is correctly loaded/saved in both vLLM and HuggingFace sides
+        self.post_projs_vllm = MergedColumnParallelLinear(
+            emb_dim * num_embedders,
+            self.hidden_size * num_embedders,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.post_projs_vllm",
+        )
 
     def _shift_right_ignore_eos(
         self, tensor: torch.Tensor, n: int, eos_token_id: int = 2
@@ -342,12 +367,12 @@ class NgramEmbedding(nn.Module):
             return self._vocab_mods_cache
 
         vocab_mods = {}
-        vocab_size = self.config.vocab_size
+        vocab_size = self.vocab_size
 
-        for i in range(2, self.n + 1):
-            for j in range(self.k):
-                index = (i - 2) * self.k + j
-                emb_vocab_dim = int(self.m + index * 2 + 1)
+        for i in range(2, self.emb_neighbor_num + 1):
+            for j in range(self.emb_split_num):
+                index = (i - 2) * self.emb_split_num + j
+                emb_vocab_dim = int(self.ngram_hash_modulus_base + index * 2 + 1)
 
                 mods = []
                 power_mod = 1
@@ -391,7 +416,7 @@ class NgramEmbedding(nn.Module):
         # Determine complete context
         if ngram_context is not None:
             context = torch.cat(
-                [ngram_context[..., -(self.n - 1) :], input_ids], dim=-1
+                [ngram_context[..., -(self.emb_neighbor_num - 1) :], input_ids], dim=-1
             )
         else:
             context = input_ids
@@ -405,16 +430,16 @@ class NgramEmbedding(nn.Module):
 
         # Compute shifted IDs
         shifted_ids = {}
-        for i in range(2, self.n + 1):
+        for i in range(2, self.emb_neighbor_num + 1):
             shifted_ids[i] = self._shift_right_ignore_eos(
                 context, i - 1, eos_token_id=self.config.eos_token_id
             )
 
         # Add N-gram embeddings
-        for i in range(2, self.n + 1):
-            for j in range(self.k):
-                index = (i - 2) * self.k + j
-                emb_vocab_dim = int(self.m + index * 2 + 1)
+        for i in range(2, self.emb_neighbor_num + 1):
+            for j in range(self.emb_split_num):
+                index = (i - 2) * self.emb_split_num + j
+                emb_vocab_dim = int(self.ngram_hash_modulus_base + index * 2 + 1)
 
                 ngram_ids = self._get_ngram_ids(
                     context, shifted_ids, vocab_mods[(i, j)], ngram=i
@@ -429,7 +454,7 @@ class NgramEmbedding(nn.Module):
                 x = x + x_proj.to(x.device)
 
         # Normalize
-        x = x / (1 + self.k * (self.n - 1))
+        x = x / (1 + self.emb_split_num * (self.emb_neighbor_num - 1))
 
         return x
 
