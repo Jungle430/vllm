@@ -2,24 +2,23 @@
 # Copyright (c) 2025 Meituan
 # This code is licensed under the MIT License, for details, see the ./LICENSE file.
 
-from typing import Optional, Tuple, Dict, List
+from typing import Dict, List, Tuple, Optional
 
 import torch
 from torch import nn
-
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast
-from transformers.utils import auto_docstring
+from transformers.models.longcat_flash import LongcatFlashConfig
 from transformers.models.longcat_flash.modeling_longcat_flash import (
+    LongcatFlashDecoderLayer,
     LongcatFlashForCausalLM,
     LongcatFlashModel,
+    LongcatFlashPreTrainedModel,
     LongcatFlashRMSNorm,
     LongcatFlashRotaryEmbedding,
-    LongcatFlashDecoderLayer,
-    LongcatFlashPreTrainedModel,
 )
-from transformers.models.longcat_flash import LongcatFlashConfig
+from transformers.utils import auto_docstring
 
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -291,7 +290,7 @@ class NgramEmbedding(nn.Module):
         emb_split_num: int,
         emb_neighbor_num: int,
         hidden_size: int,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -305,11 +304,11 @@ class NgramEmbedding(nn.Module):
         self.emb_neighbor_num = emb_neighbor_num
         self.hidden_size = hidden_size
 
-        self._init_ngram_embeddings(quant_config)
+        self._init_ngram_embeddings(quant_config, prefix)
         self._vocab_mods_cache = None
 
     def _init_ngram_embeddings(
-        self, quant_config: Optional[QuantizationConfig] = None, prefix: str = ""
+        self, quant_config: QuantizationConfig | None = None, prefix: str = ""
     ) -> None:
         """Initialize N-gram embedding and projection layers."""
         num_embedders = self.emb_split_num * (self.emb_neighbor_num - 1)
@@ -327,14 +326,6 @@ class NgramEmbedding(nn.Module):
 
         self.embedders = nn.ModuleList(embedders)
         self.post_projs = nn.ModuleList(post_projs)
-        # TODO: notice post_projs -> post_projs_vllm, and make sure the state dict is correctly loaded/saved in both vLLM and HuggingFace sides
-        self.post_projs_vllm = MergedColumnParallelLinear(
-            emb_dim * num_embedders,
-            self.hidden_size * num_embedders,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.post_projs_vllm",
-        )
 
     def _shift_right_ignore_eos(
         self, tensor: torch.Tensor, n: int, eos_token_id: int = 2
